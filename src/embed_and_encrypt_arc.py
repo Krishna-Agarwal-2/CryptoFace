@@ -6,19 +6,18 @@ from tqdm import tqdm
 import numpy as np
 import tenseal as ts
 from insightface.app import FaceAnalysis
-
 from pathlib import Path
 
 # Set up
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"📦 Using device: {device}")
 
-app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider' if device == "cuda" else 'CPUExecutionProvider'])
 app.prepare(ctx_id=0 if device == "cuda" else -1)
 
-# Input directory: unprocessed full images
+# Input directory: flat images (e.g. person1_1.jpg, person2_1.jpg)
 input_dir = Path("data/train")
-identities = sorted(os.listdir(input_dir))
+image_paths = list(input_dir.glob("*.jpg"))
 
 # Encryption context
 context = ts.context(
@@ -30,35 +29,39 @@ context.global_scale = 2**40
 context.generate_galois_keys()
 
 encrypted_db = {}
+seen_identities = set()
 
-print(f"🚀 Encrypting ArcFace embeddings from: {input_dir}...\n")
+print(f"🚀 Encrypting NORMALIZED ArcFace embeddings from: {input_dir}...\n")
 
-for identity in tqdm(identities):
-    identity_dir = input_dir / identity
-    images = list(identity_dir.glob("*.jpg"))
-    
-    if not images:
+for image_path in tqdm(image_paths):
+    # Extract identity from filename
+    stem = image_path.stem
+    identity = "_".join(stem.split("_")[:-1])
+
+    if identity in seen_identities:
         continue
 
-    for image_path in images:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            print(f"[!] Failed to read image: {image_path.name}")
-            continue
+    img = cv2.imread(str(image_path))
+    if img is None:
+        print(f"❌ Failed to read image: {image_path.name}")
+        continue
 
-        faces = app.get(img)
+    faces = app.get(img)
+    if not faces:
+        print(f"❌ No face found in: {image_path.name}")
+        continue
 
-        if len(faces) == 0:
-            print(f"[!] No face found in: {image_path.name}")
-            continue
+    face_embedding = faces[0].embedding.astype(np.float32)
 
-        face_embedding = faces[0].embedding.astype(np.float32)
-        encrypted_embedding = ts.ckks_vector(context, face_embedding)
+    # ✅ Normalize embedding
+    face_embedding /= np.linalg.norm(face_embedding)
 
-        encrypted_db[identity] = encrypted_embedding
-        break  # ✅ Break only after a successful embedding
+    # Encrypt and serialize
+    encrypted_vector = ts.ckks_vector(context, face_embedding)
+    encrypted_db[identity] = encrypted_vector.serialize()
+    seen_identities.add(identity)
 
-# Save encrypted DB
+# Save encrypted database (serialized vectors)
 with open("data/encrypted_embeddings_arc.pkl", "wb") as f:
     pickle.dump(encrypted_db, f)
 

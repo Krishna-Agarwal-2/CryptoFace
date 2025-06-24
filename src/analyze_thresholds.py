@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc, precision_recall_fscore_support, accuracy_score
 
-CSV_PATH = "data/similarity_scores1.csv"
+CSV_PATH = "data/similarity_scores_arc_balanced.csv"
 
 # Load similarity results
 df = pd.read_csv(CSV_PATH)
@@ -48,5 +48,5 @@ plt.title("Receiver Operating Characteristic (ROC)")
 plt.legend(loc="lower right")
 plt.grid(True)
 plt.tight_layout()
-plt.savefig("data/roc_curve1.png")
+plt.savefig("data/roc_curve_arc.png")
 plt.show()

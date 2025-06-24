@@ -1,71 +1,91 @@
-import os
-import cv2
-import torch
-import pickle
+# ===========================
+# log_similarities_balanced.py (Updated)
+# ===========================
+
+import torch, pickle, random, csv
+import tenseal as ts
+from pathlib import Path
+from PIL import Image
+from facenet_pytorch import InceptionResnetV1
+from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
-import tenseal as ts
-from insightface.app import FaceAnalysis
 
-from pathlib import Path
+# Paths
+TEST_DIR = Path("data/retina_test_faces")
+PICKLE_FILE = Path("data/encrypted_embeddings1.pkl")
+CONTEXT_PATH = Path("context1.context")
+CSV_OUT = Path("data/similarity_scores1.csv")
 
-# Set up
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"📦 Using device: {device}")
+# Load model
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=0 if device == "cuda" else -1)
+# Preprocessing
+transform = transforms.Compose([
+    transforms.Resize((160, 160)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
 
-# Input directory: unprocessed full images
-input_dir = Path("data/train")
-identities = sorted(os.listdir(input_dir))
+# Load context and encrypted DB
+with open(CONTEXT_PATH, "rb") as f:
+    context = ts.context_from(f.read())
 
-# Encryption context
-context = ts.context(
-    ts.SCHEME_TYPE.CKKS,
-    poly_modulus_degree=8192,
-    coeff_mod_bit_sizes=[60, 40, 40, 60],
-)
-context.global_scale = 2**40
-context.generate_galois_keys()
+with open(PICKLE_FILE, "rb") as f:
+    encrypted_db = pickle.load(f)
 
-encrypted_db = {}
+# Dot product similarity function (decrypt only final result)
+def encrypted_dot_product(vec1, vec2):
+    return (vec1.dot(vec2)).decrypt()[0]
 
-print(f"🚀 Encrypting ArcFace embeddings from: {input_dir}...\n")
+# Identity extraction (matches new DB format)
+def extract_identity(filename):
+    return "_".join(filename.split("_")[:-1])
 
-for identity in tqdm(identities):
-    identity_dir = input_dir / identity
-    images = list(identity_dir.glob("*.jpg"))
-    
-    if not images:
-        continue
+# Get list of identities in DB
+all_identities = list(encrypted_db.keys())
 
-    for image_path in images:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            print(f"[!] Failed to read image: {image_path.name}")
-            continue
+# CSV Logging
+with open(CSV_OUT, "w", newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(["query_file", "ref_identity", "query_identity", "similarity", "match"])
 
-        faces = app.get(img)
+    for img_path in tqdm(sorted(TEST_DIR.glob("*.jpg")), desc="🔐 Authenticating"):
+        try:
+            # Load and preprocess test image
+            img = Image.open(img_path).convert("RGB")
+            tensor = transform(img).unsqueeze(0).to(device)
 
-        if len(faces) == 0:
-            print(f"[!] No face found in: {image_path.name}")
-            continue
+            with torch.no_grad():
+                emb = model(tensor).squeeze(0).cpu().numpy()
+                emb = emb / np.linalg.norm(emb)
 
-        face_embedding = faces[0].embedding.astype(np.float32)
-        encrypted_embedding = ts.ckks_vector(context, face_embedding)
+            enc_query = ts.ckks_vector(context, emb)
+            query_identity = extract_identity(img_path.stem)
 
-        encrypted_db[identity] = encrypted_embedding
-        break  # Only one image per identity for training
+            # Skip if query identity isn't in the encrypted DB
+            if query_identity not in encrypted_db:
+                print(f"[!] Missing ref identity: {query_identity}")
+                continue
 
-# Save encrypted DB
-with open("data/encrypted_embeddings_arc.pkl", "wb") as f:
-    pickle.dump(encrypted_db, f)
+            # === Genuine match ===
+            enc_ref = ts.ckks_vector_from(context, encrypted_db[query_identity])
+            sim_true = encrypted_dot_product(enc_query, enc_ref)
+            writer.writerow([
+                img_path.stem, query_identity, query_identity, sim_true, "yes"
+            ])
 
-# Save encryption context
-with open("context_arc.context", "wb") as f:
-    f.write(context.serialize(save_secret_key=True))
+            # === Impostor match ===
+            impostors = [id_ for id_ in all_identities if id_ != query_identity]
+            wrong_identity = random.choice(impostors)
+            enc_wrong = ts.ckks_vector_from(context, encrypted_db[wrong_identity])
+            sim_false = encrypted_dot_product(enc_query, enc_wrong)
+            writer.writerow([
+                img_path.stem, wrong_identity, query_identity, sim_false, "no"
+            ])
 
-print(f"\n✅ Done. Encrypted DB → data/encrypted_embeddings_arc.pkl")
-print(f"🔐 Context saved → context_arc.context")
-print(f"🧠 Total identities encrypted: {len(encrypted_db)}")
+        except Exception as e:
+            print(f"[X] Error on {img_path.name}: {e}")
+
+print(f"\n✅ Finished logging results → {CSV_OUT}")
